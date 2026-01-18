@@ -2,10 +2,10 @@
 #include "ofMain.h"
 #include "ofxGui.h"
 
+
 class ofApp : public ofBaseApp {
 public:
 	~ofApp();
-
 	// Main openFrameworks functions
 	void setup();
 	void update();
@@ -18,6 +18,13 @@ public:
 	void setupGraphics();
 	void setupGUI();
 	void setupAudio();
+	void setupVideoCapture();
+
+	// Video capture functions
+	void updateVideoCapture();
+	void captureCurrentFrame();
+	void toggleVideoCapture();
+	void changeVideoDevice();
 
 	// Image loading and processing
 	void loadImage(const std::string & path);
@@ -52,11 +59,22 @@ public:
 	void drawProcessedImage();
 	void drawPlayhead();
 	void drawActiveFrequencies();
+	void drawVideoPreview();
 
 	// Input handling functions
 	void resetImageParameters();
 	void openImageDialog();
 	void togglePlayback();
+
+	// Video capture components
+	ofVideoGrabber vidGrabber;
+	ofImage cvColorImg;
+	ofImage cvGrayImg;
+	bool isCapturing = true;
+	bool showVideoPreview = true;
+	int camWidth = 1080;
+	int camHeight = 620;
+	int camFps = 30;
 
 	// Image data
 	ofImage original;
@@ -86,11 +104,15 @@ public:
 	ofxFloatSlider volume;
 	ofxFloatSlider minFreqSlider;
 	ofxFloatSlider maxFreqSlider;
+	ofxIntSlider videoDeviceId;
+	ofxToggle showVideo;
+	ofxLabel captureStatus;
 
 	float lastContrast = 1.0f;
 	float lastExposure = 0.0f;
 	float lastSobel = 1.0f;
 	float lastPlayheadSpeed = 120.0f;
+	int lastVideoDeviceId = 0;
 
 	// Playhead
 	float playheadX = 0.0f;
