@@ -2,6 +2,13 @@
 #include "ofMain.h"
 #include "ofxGui.h"
 
+#ifdef TARGET_LINUX
+// Allow Linux-only access to GStreamer utils for robust webcam pipelines.
+#include "ofGstVideoGrabber.h"
+#endif
+
+#include <vector>
+
 
 class ofApp : public ofBaseApp {
 public:
@@ -25,6 +32,7 @@ public:
 	void captureCurrentFrame();
 	void toggleVideoCapture();
 	void changeVideoDevice();
+	bool setupVideoCaptureForcedRawYUY2(int deviceId, int w, int h, int fps);
 
 	// Image loading and processing
 	void loadImage(const std::string & path);
@@ -60,6 +68,7 @@ public:
 	void drawPlayhead();
 	void drawActiveFrequencies();
 	void drawVideoPreview();
+	void drawStatusOverlay();
 
 	// Input handling functions
 	void resetImageParameters();
@@ -72,9 +81,15 @@ public:
 	ofImage cvGrayImg;
 	bool isCapturing = true;
 	bool showVideoPreview = true;
-	int camWidth = 1080;
-	int camHeight = 620;
+	// On Linux, the GUI selector is an index into listDevices(), but the actual V4L2 id
+	// we must pass to setDeviceID() is typically devices[index].id (often /dev/video{id}).
+	int activeVideoDeviceId = -1;
+	int camWidth = 640;   // Safer default for Linux/V4L2
+	int camHeight = 480;  // Safer default for Linux/V4L2
 	int camFps = 30;
+	uint64_t camInitMs = 0;
+	uint64_t lastFrameMs = 0;
+	uint64_t frameCount = 0;
 
 	// Image data
 	ofImage original;
@@ -86,8 +101,8 @@ public:
 	// Audio components
 	ofSoundStream soundStream;
 	ofSoundBuffer soundBuffer;
-	vector<float> audioBuffer;
-	vector<float> phases; // For oscillator phases
+	std::vector<float> audioBuffer;
+	std::vector<float> phases; // For oscillator phases
 	float sampleRate = 44100;
 	int bufferSize = 512;
 

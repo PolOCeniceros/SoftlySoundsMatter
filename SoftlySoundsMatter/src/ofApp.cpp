@@ -17,6 +17,10 @@
  */
 #include "ofApp.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+
 //--------------------------------------------------------------
 /**
  * @brief Destructor - ensures audio stream and video are properly closed
@@ -53,6 +57,7 @@ void ofApp::setup() {
 void ofApp::setupGraphics() {
 	ofSetFrameRate(60);
 	ofBackground(0);
+	ofSetLogLevel(OF_LOG_VERBOSE);
 }
 
 //--------------------------------------------------------------
@@ -63,7 +68,8 @@ void ofApp::setupGraphics() {
  */
 void ofApp::setupGUI() {
 	gui.setup();
-	gui.add(videoDeviceId.setup("Camera Device ID", 0, 0, 10));
+	// This is an index into vidGrabber.listDevices(); the actual V4L2 id is devices[index].id.
+	gui.add(videoDeviceId.setup("Camera Device (index)", 0, 0, 10));
 	gui.add(showVideo.setup("Show Video Preview", true));
 	gui.add(captureStatus.setup("Status", "Capturing"));
 	gui.add(contrast.setup("Contrast", 1.0f, 0.2f, 3.0f));
@@ -82,20 +88,114 @@ void ofApp::setupGUI() {
  * Initializes camera at 640x480 30fps and allocates OpenCV buffers
  */
 void ofApp::setupVideoCapture() {
-	// List available devices
-	vidGrabber.listDevices();
+	// On some ARM/GStreamer setups, force libv4l2 conversion to avoid DMA_DRM formats
+	setenv("GST_V4L2_USE_LIBV4L2", "1", 1);
+	camInitMs = ofGetElapsedTimeMillis();
+	lastFrameMs = 0;
+	frameCount = 0;
 
-	// Setup video grabber
-	vidGrabber.setDeviceID(videoDeviceId);
+#ifdef TARGET_LINUX
+	// Ensure we are using the GStreamer grabber on Linux so we can fallback to a forced pipeline.
+	if (!vidGrabber.getGrabber<ofGstVideoGrabber>()) {
+		vidGrabber.setGrabber(std::make_shared<ofGstVideoGrabber>());
+	}
+	vidGrabber.setVerbose(true);
+#endif
+
+	// Enumerate devices with logging
+	auto devices = vidGrabber.listDevices();
+	if (devices.empty()) {
+		ofLogWarning() << "No video devices found.";
+		captureStatus = "No camera found";
+		isCapturing = false;
+		return;
+	}
+	for (size_t i = 0; i < devices.size(); ++i) {
+		ofLogNotice() << "Device idx " << i << " (id " << devices[i].id << "): '" << devices[i].deviceName
+			<< "' available=" << (devices[i].bAvailable ? "yes" : "no");
+	}
+	// Update slider bounds to valid indices
+	videoDeviceId.setMin(0);
+	videoDeviceId.setMax((int)devices.size() - 1);
+
+	// Choose target device: prefer user-selected if available, else first available
+	int targetIndex = (int)videoDeviceId;
+	if (targetIndex < 0 || targetIndex >= (int)devices.size() || !devices[targetIndex].bAvailable) {
+		for (size_t i = 0; i < devices.size(); ++i) {
+			if (devices[i].bAvailable) { targetIndex = (int)i; break; }
+		}
+		videoDeviceId = targetIndex;
+	}
+	const int targetId = devices[targetIndex].id;
+	activeVideoDeviceId = targetId;
+
+	bool inited = false;
+	std::string attemptMsg;
+
+	// Attempt 1: Native pixel format, requested FPS
+	vidGrabber.setDeviceID(targetId);
+	vidGrabber.setPixelFormat(OF_PIXELS_NATIVE);
 	vidGrabber.setDesiredFrameRate(camFps);
-	vidGrabber.setup(camWidth, camHeight);
+	attemptMsg = "Attempt#1 native fmt with FPS at " + ofToString(camWidth) + "x" + ofToString(camHeight);
+	ofLogVerbose() << attemptMsg;
+	inited = vidGrabber.setup(camWidth, camHeight);
 
-	// Allocate OpenCV images
+	// Attempt 2: Native format, no explicit FPS
+	if (!inited) {
+		ofLogWarning() << "Init failed. " << attemptMsg << ". Retrying without setDesiredFrameRate.";
+		vidGrabber.close();
+		vidGrabber.setDeviceID(targetId);
+		vidGrabber.setPixelFormat(OF_PIXELS_NATIVE);
+		inited = vidGrabber.setup(camWidth, camHeight);
+	}
+
+	// Attempt 3: Force RGB conversion (some drivers refuse native caps)
+	if (!inited) {
+		ofLogWarning() << "Init failed. Retrying with RGB conversion.";
+		vidGrabber.close();
+		vidGrabber.setDeviceID(targetId);
+		vidGrabber.setPixelFormat(OF_PIXELS_RGB);
+		inited = vidGrabber.setup(camWidth, camHeight);
+	}
+
+	// Attempt 4: Safe 640x480 RGB
+	if (!inited) {
+		ofLogWarning() << "Init failed. Retrying 640x480 RGB safe mode.";
+		vidGrabber.close();
+		vidGrabber.setDeviceID(targetId);
+		vidGrabber.setPixelFormat(OF_PIXELS_RGB);
+		inited = vidGrabber.setup(640, 480);
+	}
+
+	// Attempt 5 (Linux): Force raw YUY2 capture + videoconvert (avoids needing jpegdec/h264dec plugins)
+	// This is especially helpful when the camera advertises MJPG/H264 at 30fps but decode plugins are missing.
+	if (!inited) {
+		ofLogWarning() << "Init failed. Retrying forced raw YUY2 pipeline (Linux fallback).";
+		inited = setupVideoCaptureForcedRawYUY2(targetId, 640, 480, 30);
+	}
+
+	// IMPORTANT (Linux/GStreamer): ofVideoGrabber::isInitialized() also depends on an allocated texture.
+	// The texture is typically allocated on the first received frame inside ofVideoGrabber::update().
+	// So we must not treat vidGrabber.isInitialized()==false at this stage as a camera-init failure.
+	if (!inited) {
+		ofLogError() << "Camera failed to initialize after all attempts. Check /dev/video* permissions, whether it's busy, and GStreamer plugins.";
+		isCapturing = false;
+		captureStatus = "Camera init failed";
+		return;
+	}
+
+	// Update to actual reported size
+	camWidth = (int)vidGrabber.getWidth();
+	camHeight = (int)vidGrabber.getHeight();
+	ofLogNotice() << "Using camera '" << devices[targetIndex].deviceName << "' at "
+		<< camWidth << "x" << camHeight << " (device id " << targetId << ", index " << targetIndex << ")";
+
+	// Allocate working images to the actual camera size
 	cvColorImg.allocate(camWidth, camHeight, OF_IMAGE_COLOR);
 	cvGrayImg.allocate(camWidth, camHeight, OF_IMAGE_GRAYSCALE);
 
 	isCapturing = true;
-	captureStatus = "Capturing";
+	captureStatus = "Capturing (waiting for frames...)";
 }
 
 //--------------------------------------------------------------
@@ -105,15 +205,84 @@ void ofApp::setupVideoCapture() {
  * Only updates when capturing is enabled
  */
 void ofApp::updateVideoCapture() {
-	if (isCapturing && vidGrabber.isInitialized()) {
+	// ofVideoGrabber::isInitialized() may be false until the first frame allocates a texture.
+	// Use the underlying grabber's initialized state for update gating, so frames can start flowing.
+	const bool grabberPipelineUp =
+		(vidGrabber.getGrabber() != nullptr) && vidGrabber.getGrabber()->isInitialized();
+
+	if (isCapturing && grabberPipelineUp) {
 		vidGrabber.update();
 
 		if (vidGrabber.isFrameNew()) {
-			// Convert to OpenCV format
-			cvColorImg.setFromPixels(vidGrabber.getPixels());
-			cvGrayImg = cvColorImg; // Automatic conversion to grayscale
+			lastFrameMs = ofGetElapsedTimeMillis();
+			frameCount++;
+			captureStatus = "Capturing (" + ofToString(frameCount) + " frames)";
+		} else {
+			// If the grabber initialized but we never get frames, auto-fallback to raw YUY2 on Linux.
+			const uint64_t now = ofGetElapsedTimeMillis();
+			const bool noFramesYet = (frameCount == 0);
+			if (noFramesYet && (now - camInitMs) > 2000) {
+				captureStatus = "No frames yet (2s). Retrying raw YUY2...";
+				ofLogWarning() << "No frames received after 2s; attempting raw YUY2 fallback.";
+				// Best-effort: retry with a forced raw pipeline using the actual V4L2 device id.
+				if (activeVideoDeviceId >= 0) {
+					setupVideoCaptureForcedRawYUY2(activeVideoDeviceId, 640, 480, 30);
+				}
+				camInitMs = now; // avoid tight retry loops
+			}
 		}
 	}
+}
+
+bool ofApp::setupVideoCaptureForcedRawYUY2(int deviceId, int w, int h, int fps) {
+#ifdef TARGET_LINUX
+	// Ensure the grabber is a GStreamer grabber.
+	auto gstGrabber = vidGrabber.getGrabber<ofGstVideoGrabber>();
+	if (!gstGrabber) {
+		vidGrabber.setGrabber(std::make_shared<ofGstVideoGrabber>());
+		gstGrabber = vidGrabber.getGrabber<ofGstVideoGrabber>();
+	}
+	if (!gstGrabber) {
+		ofLogError() << "Linux fallback requested but GStreamer grabber not available.";
+		return false;
+	}
+
+	// Fully close current pipeline/texture state first.
+	vidGrabber.close();
+	frameCount = 0;
+	lastFrameMs = 0;
+	camInitMs = ofGetElapsedTimeMillis();
+
+	// Force raw YUY2 from V4L2 and convert to RGB for OF. This avoids jpegdec/h264 decode requirements.
+	const std::string dev = "/dev/video" + ofToString(deviceId);
+	const std::string pipeline =
+		"v4l2src device=" + dev + " io-mode=2 ! "
+		"video/x-raw,format=YUY2,width=" + ofToString(w) + ",height=" + ofToString(h) + ",framerate=" + ofToString(fps) + "/1 ! "
+		"videoconvert";
+
+	ofLogNotice() << "Forced pipeline: " << pipeline;
+
+	// Ask appsink for RGB and start.
+	auto * utils = gstGrabber->getGstVideoUtils();
+	const bool ok = utils->setPipeline(pipeline, OF_PIXELS_RGB, false, w, h) && utils->startPipeline();
+	if (!ok) {
+		ofLogError() << "Forced raw YUY2 pipeline failed. Check permissions on " << dev << " and GStreamer v4l2/videoconvert availability.";
+		return false;
+	}
+
+	// Update sizes based on forced request.
+	camWidth = w;
+	camHeight = h;
+	isCapturing = true;
+	captureStatus = "Capturing (raw YUY2 fallback)";
+	return true;
+#else
+	(void)deviceId;
+	(void)w;
+	(void)h;
+	(void)fps;
+	return false;
+#endif
 }
 
 //--------------------------------------------------------------
@@ -124,8 +293,22 @@ void ofApp::updateVideoCapture() {
  */
 void ofApp::captureCurrentFrame() {
 	if (vidGrabber.isInitialized() && vidGrabber.isFrameNew()) {
-		// Create an ofImage from the current frame
-		original.setFromPixels(vidGrabber.getPixels());
+		// Read back from texture to ensure RGB pixels regardless of native format
+		ofPixels rgbPix;
+		rgbPix.allocate(vidGrabber.getWidth(), vidGrabber.getHeight(), OF_PIXELS_RGB);
+		if (vidGrabber.getTexture().isAllocated()) {
+			vidGrabber.getTexture().readToPixels(rgbPix);
+		} else {
+			// Fallback to CPU pixels if texture isn't available
+			rgbPix = vidGrabber.getPixels();
+			if (rgbPix.getNumChannels() != 3) {
+				// Last resort: create a grayscale to RGB copy
+				ofPixels tmp = rgbPix;
+				tmp.setImageType(OF_IMAGE_COLOR);
+				rgbPix = tmp;
+			}
+		}
+		original.setFromPixels(rgbPix);
 		original.update();
 
 		// Allocate and trigger processing
@@ -166,12 +349,64 @@ void ofApp::changeVideoDevice() {
 		vidGrabber.close();
 	}
 
-	vidGrabber.setDeviceID(videoDeviceId);
-	vidGrabber.setDesiredFrameRate(camFps);
-	vidGrabber.setup(camWidth, camHeight);
+	// Re-run the same robust selection/initialization as in setup
+	auto devices = vidGrabber.listDevices();
+	int targetIndex = (int)videoDeviceId;
+	if (devices.empty()) {
+		isCapturing = false;
+		captureStatus = "No camera found";
+		return;
+	}
+	if (targetIndex < 0 || targetIndex >= (int)devices.size() || !devices[targetIndex].bAvailable) {
+		for (size_t i = 0; i < devices.size(); ++i) {
+			if (devices[i].bAvailable) { targetIndex = (int)i; break; }
+		}
+		videoDeviceId = targetIndex;
+	}
+	const int targetId = devices[targetIndex].id;
+	activeVideoDeviceId = targetId;
 
+	bool inited = false;
+	// Attempt 1: native with FPS
+	vidGrabber.setDeviceID(targetId);
+	vidGrabber.setPixelFormat(OF_PIXELS_NATIVE);
+	vidGrabber.setDesiredFrameRate(camFps);
+	inited = vidGrabber.setup(camWidth, camHeight);
+	// Attempt 2: native without FPS
+	if (!inited) {
+		vidGrabber.close();
+		vidGrabber.setDeviceID(targetId);
+		vidGrabber.setPixelFormat(OF_PIXELS_NATIVE);
+		inited = vidGrabber.setup(camWidth, camHeight);
+	}
+	// Attempt 3: RGB
+	if (!inited) {
+		vidGrabber.close();
+		vidGrabber.setDeviceID(targetId);
+		vidGrabber.setPixelFormat(OF_PIXELS_RGB);
+		inited = vidGrabber.setup(camWidth, camHeight);
+	}
+	// Attempt 4: 640x480 RGB safe
+	if (!inited) {
+		vidGrabber.close();
+		vidGrabber.setDeviceID(targetId);
+		vidGrabber.setPixelFormat(OF_PIXELS_RGB);
+		inited = vidGrabber.setup(640, 480);
+	}
+	// Attempt 5: forced raw fallback (Linux)
+	if (!inited) {
+		inited = setupVideoCaptureForcedRawYUY2(targetId, 640, 480, 30);
+	}
+	if (!inited || !vidGrabber.isInitialized()) {
+		ofLogError() << "Camera failed to initialize after all attempts on device change.";
+		isCapturing = false;
+		captureStatus = "Camera init failed";
+		return;
+	}
+	camWidth = (int)vidGrabber.getWidth();
+	camHeight = (int)vidGrabber.getHeight();
 	isCapturing = true;
-	captureStatus = "Capturing - Device " + ofToString((int)videoDeviceId);
+	captureStatus = "Capturing - Device id " + ofToString(targetId) + " (index " + ofToString(targetIndex) + ")";
 }
 
 //--------------------------------------------------------------
@@ -183,6 +418,15 @@ void ofApp::changeVideoDevice() {
 void ofApp::setupAudio() {
 	soundStream.printDeviceList();
 	ofSoundStreamSettings settings;
+	// On Linux/Pi the default device can be "none" depending on ALSA/Pulse/PipeWire.
+	// Pick the first output-capable device if one exists.
+	auto devices = soundStream.getDeviceList();
+	for (const auto & d : devices) {
+		if (d.outputChannels > 0) {
+			settings.setOutDevice(d);
+			break;
+		}
+	}
 	settings.setOutListener(this);
 	settings.sampleRate = sampleRate;
 	settings.numOutputChannels = 2;
@@ -620,6 +864,9 @@ void ofApp::draw() {
 	}
 
 	gui.draw();
+
+	// Always draw status overlay to aid debugging on Linux
+	drawStatusOverlay();
 }
 
 //--------------------------------------------------------------
@@ -629,10 +876,15 @@ void ofApp::draw() {
  * Shows current camera feed when capturing
  */
 void ofApp::drawVideoPreview() {
-	if (vidGrabber.isInitialized()) {
-		// Calculate scale to fit video in window
-		float videoScale = std::min((float)ofGetWidth() / camWidth,
-			(float)ofGetHeight() / camHeight);
+	const bool grabberPipelineUp =
+		(vidGrabber.getGrabber() != nullptr) && vidGrabber.getGrabber()->isInitialized();
+
+	if (grabberPipelineUp) {
+		// Calculate scale to fit video in window using actual grabber size
+		float vw = std::max(1.0f, (float)vidGrabber.getWidth());
+		float vh = std::max(1.0f, (float)vidGrabber.getHeight());
+		float videoScale = std::min((float)ofGetWidth() / vw,
+			(float)ofGetHeight() / vh);
 
 		ofPushMatrix();
 		ofScale(videoScale, videoScale);
@@ -645,6 +897,36 @@ void ofApp::drawVideoPreview() {
 		ofDrawBitmapString("LIVE VIDEO - Press SPACE to capture frame", 20,
 			ofGetHeight() - 20);
 	}
+	else {
+		// Helpful overlay when camera didn't init
+		ofSetColor(255, 80, 80);
+		ofDrawBitmapString("No camera initialized.\n- Check /dev/video* permissions.\n- Try changing 'Camera Device ID' in GUI.\n- Install GStreamer plugins (good/bad/ugly/libav).", 20, 40);
+	}
+}
+
+//--------------------------------------------------------------
+void ofApp::drawStatusOverlay() {
+	ofPushStyle();
+	ofSetColor(255);
+	std::string status;
+	status += "Status: " + (std::string)captureStatus + "\n";
+	status += std::string("Capturing: ") + (isCapturing ? "yes" : "no") + ", Preview: " + (showVideoPreview ? "on" : "off") + "\n";
+	status += "Device index: " + ofToString((int)videoDeviceId) + "\n";
+	status += "Device id: " + ofToString(activeVideoDeviceId) + "\n";
+	const bool grabberPipelineUp =
+		(vidGrabber.getGrabber() != nullptr) && vidGrabber.getGrabber()->isInitialized();
+	status += "Grabber pipeline up: " + std::string(grabberPipelineUp ? "yes" : "no") + "\n";
+	status += "Grabber (with texture): " + std::string(vidGrabber.isInitialized() ? "yes" : "no") + "\n";
+	if (grabberPipelineUp) {
+		status += "Size: " + ofToString((int)vidGrabber.getWidth()) + "x" + ofToString((int)vidGrabber.getHeight()) + "\n";
+		status += "FrameNew: " + std::string(vidGrabber.isFrameNew() ? "yes" : "no") + "\n";
+		status += "Frames: " + ofToString(frameCount) + "\n";
+		if (lastFrameMs > 0) {
+			status += "Last frame: " + ofToString((uint64_t)(ofGetElapsedTimeMillis() - lastFrameMs)) + "ms ago\n";
+		}
+	}
+	ofDrawBitmapString(status, 20, 60);
+	ofPopStyle();
 }
 
 //--------------------------------------------------------------
