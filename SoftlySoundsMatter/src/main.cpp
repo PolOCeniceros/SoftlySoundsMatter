@@ -11,9 +11,18 @@ int main() {
 	setenv("GST_DEBUG", "2", 0);
 
 	ofGLFWWindowSettings settings;
-	settings.setSize(1280, 800);
-	settings.resizable = true;
-	settings.decorated = true;
+	// Start in fullscreen so we don't see Debian panels/menus (kiosk-style).
+	settings.windowMode = OF_FULLSCREEN;
+	// Size is ignored in fullscreen on most platforms, but keep a sane default.
+	settings.setSize(1920, 1080);
+	settings.resizable = false;
+	settings.decorated = false;
+	// On some Linux window managers, fullscreen requests can be ignored; maximize as a fallback.
+	settings.maximized = true;
+	// Keep the window above desktop panels/menus (taskbar, top bar) when possible.
+	settings.floating = true;
+	// Explicitly target primary monitor by default.
+	settings.monitor = 0;
 
 	auto window = ofCreateWindow(settings);
 	ofRunApp(window, std::make_shared<ofApp>());

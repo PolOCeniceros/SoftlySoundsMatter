@@ -1,137 +1,95 @@
 #pragma once
 #include "ofMain.h"
-#include "ofxGui.h"
 
-#ifdef TARGET_LINUX
-// Allow Linux-only access to GStreamer utils for robust webcam pipelines.
-#include "ofGstVideoGrabber.h"
-#endif
+#include "AudioEngine.h"
+#include "ColumnSonifier.h"
+#include "ImageProcessor.h"
+#include "VideoCaptureManager.h"
+#include "AnalogKnob.h"
+#include "Mcp3008Spi.h"
+#include "GpioButton.h"
 
-#include <vector>
+#include <array>
+#include <cstdint>
 
 
 class ofApp : public ofBaseApp {
 public:
+	ofApp();
 	~ofApp();
-	// Main openFrameworks functions
 	void setup();
 	void update();
 	void draw();
 	void keyPressed(int key);
-	void windowResized(int w, int h);
-	void audioOut(ofSoundBuffer & buffer);
 
-	// Setup functions
-	void setupGraphics();
-	void setupGUI();
-	void setupAudio();
-	void setupVideoCapture();
+private:
+	// Former GUI-controlled parameters (now headless / no on-screen widgets).
+	struct Params {
+		float contrast = 1.0f;
+		float exposure = 0.0f;
+		float sobelStrength = 1.0f;
 
-	// Video capture functions
-	void updateVideoCapture();
-	void captureCurrentFrame();
-	void toggleVideoCapture();
-	void changeVideoDevice();
-	bool setupVideoCaptureForcedRawYUY2(int deviceId, int w, int h, int fps);
+		float playheadSpeed = 120.0f;
+		float volume = 0.5f;
+		float minFreq = 100.0f;
+		float maxFreq = 4000.0f;
+	};
 
-	// Image loading and processing
-	void loadImage(const std::string & path);
-	void allocateProcessedImages();
-	void processImage();
-	void resizeToGrayscale();
-	void applyImageAdjustments();
-	void applySobelFilter();
-	void applySobel(const ofPixels & src, ofPixels & dst);
-	int calculateSobelMagnitude(const ofPixels & src, int x, int y, int width);
+	struct DrawTransform {
+		float scale = 1.0f;
+		float offsetX = 0.0f;
+		float offsetY = 0.0f;
+	};
 
-	// Audio synthesis functions
-	void clearAudioBuffer(ofSoundBuffer & buffer);
-	int getImageXFromPlayhead();
-	float calculateDrawScale();
-	void ensurePhasesVectorSize();
-	void synthesizeAudioFromColumn(int columnX);
-	float getPixelBrightness(ofPixels & pixels, int x, int y);
-	void addFrequencyToBuffer(int y, float brightness, int totalHeight);
-	float calculateFrequencyFromY(int y, int totalHeight);
-	void normalizeAudioBuffer(int activeFrequencies);
-	void fillSoundBuffer(ofSoundBuffer & buffer);
+	DrawTransform getProcessedTransform() const;
 
-	// Update helper functions
-	void checkAndProcessImageChanges();
-	bool hasImageParametersChanged();
-	void updateLastParameters();
-	void updateFrequencyRange();
 	void updatePlayheadPosition();
+	int getImageXFromPlayhead() const;
 
-	// Drawing functions
-	void drawProcessedImage();
-	void drawPlayhead();
-	void drawActiveFrequencies();
 	void drawVideoPreview();
+	void drawProcessedView();
 	void drawStatusOverlay();
 
-	// Input handling functions
 	void resetImageParameters();
-	void openImageDialog();
+	void resetAllParametersToDefaults();
 	void togglePlayback();
 
-	// Video capture components
-	ofVideoGrabber vidGrabber;
-	ofImage cvColorImg;
-	ofImage cvGrayImg;
-	bool isCapturing = true;
-	bool showVideoPreview = true;
-	// On Linux, the GUI selector is an index into listDevices(), but the actual V4L2 id
-	// we must pass to setDeviceID() is typically devices[index].id (often /dev/video{id}).
-	int activeVideoDeviceId = -1;
-	int camWidth = 640;   // Safer default for Linux/V4L2
-	int camHeight = 480;  // Safer default for Linux/V4L2
-	int camFps = 30;
-	uint64_t camInitMs = 0;
-	uint64_t lastFrameMs = 0;
-	uint64_t frameCount = 0;
+	// Subsystems
+	AudioEngine audio;
+	VideoCaptureManager video;
+	ImageProcessor image;
+	ColumnSonifier sonifier;
 
-	// Image data
-	ofImage original;
-	ofImage graySmall;
-	ofImage sobelImg;
-	float scaleFactor = 0.25f;
-	bool imageDirty = true;
-
-	// Audio components
-	ofSoundStream soundStream;
-	ofSoundBuffer soundBuffer;
-	std::vector<float> audioBuffer;
-	std::vector<float> phases; // For oscillator phases
 	float sampleRate = 44100;
 	int bufferSize = 512;
 
-	// Frequency mapping
-	float minFreq = 100.0f; // Minimum frequency in Hz
-	float maxFreq = 4000.0f; // Maximum frequency in Hz
-
-	// GUI
-	ofxPanel gui;
-	ofxFloatSlider contrast;
-	ofxFloatSlider exposure;
-	ofxFloatSlider sobelStrength;
-	ofxFloatSlider playheadSpeed;
-	ofxFloatSlider volume;
-	ofxFloatSlider minFreqSlider;
-	ofxFloatSlider maxFreqSlider;
-	ofxIntSlider videoDeviceId;
-	ofxToggle showVideo;
-	ofxLabel captureStatus;
-
-	float lastContrast = 1.0f;
-	float lastExposure = 0.0f;
-	float lastSobel = 1.0f;
+	Params params;
 	float lastPlayheadSpeed = 120.0f;
-	int lastVideoDeviceId = 0;
 
 	// Playhead
 	float playheadX = 0.0f;
 
 	// Drawing
 	float drawScale = 1.0f;
+
+	// MCP3008 (shared SPI device) + 6 knob instances (CH0..CH5)
+	Mcp3008Spi mcp3008;
+	std::array<AnalogKnob, 6> knobs = {
+		AnalogKnob(0, 0.2f, 0.01f, 3.0f, 1.0f),         // Contrast
+		AnalogKnob(1, -1.0f, 0.01f, 1.0f, 0.0f),        // Exposure
+		AnalogKnob(2, 0.1f, 0.01f, 5.0f, 1.0f),         // Sobel Strength
+		AnalogKnob(3, -600.0f, 1.0f, 600.0f, 120.0f),   // Playhead Speed
+		AnalogKnob(4, 0.0f, 0.01f, 1.0f, 0.5f),         // Volume
+		AnalogKnob(5, 1000.0f, 10.0f, 10000.0f, 4000.0f) // Max Frequency
+	};
+
+	// After resetting to defaults, we "latch" each parameter until the physical knob moves
+	// far enough from its reset position (prevents immediate snap-back).
+	static constexpr int kKnobLatchDeadbandRaw = 8; // MCP3008 raw units (0..1023)
+	std::array<int, 6> knobLatchRaw = {0, 0, 0, 0, 0, 0};
+	std::array<bool, 6> knobUnlatched = {true, true, true, true, true, true};
+
+	// Two direct GPIO buttons (Pi header) - configured at runtime via env vars.
+	GpioButton btn1;
+	GpioButton btn2;
 };

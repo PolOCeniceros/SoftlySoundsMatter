@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-FileCopyrightText: 2022-2023 Bartosz Golaszewski <bartosz.golaszewski@linaro.org>
+
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: gpiod-glib
+Description: GObject bindings for libgpiod
+URL: 
+Version: 2.2
+Requires.private: libgpiod >= 2.1
+Libs: -L${libdir} -lgpiod-glib
+Cflags: -I${includedir}

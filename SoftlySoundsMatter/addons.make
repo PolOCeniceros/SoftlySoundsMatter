@@ -1,2 +1,1 @@
-ofxDropdown-master
-ofxGui
+addons/libgpiod-2.2
